@@ -1,0 +1,12 @@
+torch
+transformers
+sentence-transformers
+pandas
+numpy
+scikit-learn
+matplotlib
+seaborn
+scipy
+tqdm
+bitsandbytes
+accelerate
