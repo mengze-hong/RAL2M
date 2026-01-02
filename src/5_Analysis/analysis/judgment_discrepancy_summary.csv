@@ -1,0 +1,4 @@
+Metric,Count,Percentage
+Total Samples,82603,100.0%
+Samples with >= 1 Difference,66085,80.00%
+Samples with >= 2 Differences,35914,43.48%

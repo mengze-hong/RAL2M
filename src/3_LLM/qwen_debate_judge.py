@@ -1,0 +1,152 @@
+import os
+import json
+import re
+import torch
+import argparse
+from tqdm.auto import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# ------------------- ARGUMENTS -------------------
+parser = argparse.ArgumentParser()
+parser.add_argument("--batch_size", type=int, default=128)
+parser.add_argument("--input_file", type=str, default="../5_Analysis/qwen_debate_reason.jsonl")
+parser.add_argument("--output_file", type=str, default="../5_Analysis/qwen_debate_final.jsonl")
+args = parser.parse_args()
+
+# ------------------- PROMPT DESIGN -------------------
+# Using a clear structure that forces the model to start with '['
+DEBATE_JUDGE_TEMPLATE = """You are a meticulous QA evaluation agent. Your task is to determine if a retrieved question-answer pair fully resolves the user’s query. Consider whether the QA pair addresses all parts of the query and maintains semantic equivalence. Two expert justifications on why the QA is a perfect response and is NOT a perfect response to the user query are also provided as reference. Respond only with 'Yes' or 'No', no explanation.
+
+User Query: "{user_query}"
+
+Retrieved Question: "{candidate_Q}"
+Retrieved Answer: "{candidate_A}"
+
+The retrieved QA is a perfect response because: "{positive}"
+
+The retrieved QA is NOT a  perfect response because: "{negative}"
+
+Output 'Yes' if the retrieved QA is a perfect match, otherwise 'No'.
+"""
+
+
+# ------------------- 模型加载 -------------------
+LOCAL_MODEL_DIR = os.path.expanduser("~/autodl-tmp/models")
+QWEN_PATH = os.path.join(LOCAL_MODEL_DIR, "Qwen2.5-7B-Instruct")
+print("加载 Qwen2.5-7B-Instruct...")
+tokenizer = AutoTokenizer.from_pretrained(QWEN_PATH, local_files_only=True, trust_remote_code=True)
+tokenizer.padding_side = "left"
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+model = AutoModelForCausalLM.from_pretrained(
+    QWEN_PATH,
+    local_files_only=True,
+    torch_dtype=torch.float16,
+    device_map="auto",
+    trust_remote_code=True
+)
+model.eval()
+# ------------------- 加载 D1 知识库 -------------------
+print("Loading D1.jsonl to get passage text by ID...")
+id_to_passage = {}
+with open("../../data/D1.jsonl", encoding="utf-8") as f:
+    for line in f:
+        obj = json.loads(line)
+        id_to_passage[obj['id']] = (obj['Q'], obj['A'])
+
+# ------------------- 输出文件 -------------------
+os.makedirs(os.path.dirname(args.output_file) if os.path.dirname(args.output_file) else ".", exist_ok=True)
+f_out = open(args.output_file, "a", encoding="utf-8", buffering=1)
+
+processed_ids = set()
+if os.path.exists(args.output_file):
+    with open(args.output_file, encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                obj = json.loads(line)
+                if "query_id" in obj:
+                    processed_ids.add(obj["query_id"])
+
+print(f"Already processed: {len(processed_ids):,} samples. Skipping them.")
+
+# ------------------- LLM 判断函数（批量） -------------------
+def judge_retrieval_batch(batch_rows):
+    prompts = []
+    for row in batch_rows:
+        user_query = row['user_query']
+        retrieved_id = row['bge_retrieved_top1_id']
+        positive = row["qwen_debate_positive"]
+        negative = row["qwen_debate_negative"]
+        
+        if retrieved_id not in id_to_passage:
+            retrieved_q = "[Missing passage]"
+            retrieved_a = "[Missing passage]"
+        else:
+            retrieved_q, retrieved_a = id_to_passage[retrieved_id]
+        # Plug values
+        prompt = DEBATE_JUDGE_TEMPLATE.format(
+            user_query=user_query,
+            candidate_Q=retrieved_q,
+            candidate_A=retrieved_a,
+            positive=positive,
+            negative=negative
+        )
+
+        prompt = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n" + prompt + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+
+        prompts.append(prompt)
+
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=1536).to(model.device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=8,
+            temperature=0,  # fixed: avoids sampling disabled error
+            top_p=1.0,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id
+        )
+
+    results = []
+    for out in outputs:
+        text = tokenizer.decode(out[inputs.input_ids.shape[1]:], skip_special_tokens=True).strip().upper()
+        results.append("YES" in text)
+    return results
+
+# ------------------- 主循环 -------------------
+batch = []
+total_saved = len(processed_ids)
+
+print("Starting qwen-7B relevance judgment on retrieved top-1...")
+with open(args.input_file, "r", encoding="utf-8") as f:
+    for line in tqdm(f, desc="Judging retrieval"):
+        item = json.loads(line)
+        qid = item.get("query_id")
+        if qid in processed_ids:
+            continue
+
+        batch.append(item)
+        if len(batch) >= args.batch_size:
+            judgements = judge_retrieval_batch(batch)
+            for row, jud in zip(batch, judgements):
+                row = row.copy()
+                row["debate_judge"] = jud
+                f_out.write(json.dumps(row, ensure_ascii=False) + "\n")
+            total_saved += len(batch)
+            print(f"Saved: {total_saved:,} rows")
+            batch.clear()
+
+# 最后一批
+if batch:
+    judgements = judge_retrieval_batch(batch)
+    for row, jud in zip(batch, judgements):
+        row = row.copy()
+        row["debate_judge"] = jud
+        f_out.write(json.dumps(row, ensure_ascii=False) + "\n")
+    total_saved += len(batch)
+    print(f"Final batch saved. Total: {total_saved:,}")
+
+f_out.close()
+print(f"Done! Results saved to {args.output_file}")
+print("New column: qwen_judge_retrieval (True = retrieved answer is correct, False = should reject)")
